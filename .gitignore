@@ -1,0 +1,8 @@
+.classpath
+.project
+.settings
+target
+test.mp4
+Mp4DefaultTrack.jar
+Mp4DefaultTrack_fat.jar
+mp4*Track
