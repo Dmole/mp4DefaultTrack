@@ -12,6 +12,7 @@ get bc
 F="target/test_results"
 mkdir -p "$F"
 T="target/test.mp4"
+sudo bash -c "sync; echo 3 > /proc/sys/vm/drop_caches"
 
 A="$(date +%s.%N)"
 /bin/time -v java -jar target/mp4JavaTrack.jar list "$T" \
@@ -69,15 +70,26 @@ A="$(date +%s.%N)"
 B="$(date +%s.%N)"
 echo "$B-$A" | bc > "$F/perl_date.txt"
 
+A="$(date +%s.%N)"
+/bin/time -v bash src/main/bash/Mp4DefaultTrack.sh list "$T" \
+	> "$F/bash.txt" \
+	2> "$F/bash_time.txt"
+B="$(date +%s.%N)"
+echo "$B-$A" | bc > "$F/bash_date.txt"
+
 {
-echo "Memory Usage:"
+echo "### Memory Usage:"
+echo '```'
 grep "Maximum resident" "$F"/* \
 	| perl -pe 's/.*\/(.*)_time.* ([0-9]+)\n/$2\t$1\n/g' \
 	| sort -n
+echo '```'
 echo
-echo "Time Usage:"
+echo "### Time Usage:"
+echo '```'
 grep . "$F"/*_date.txt \
 	| perl -pe 's/.*\/(.*)_date.txt:([0-9.]+)\n/$2\t$1\n/g' \
 	| sort -n
+echo '```'
 } > "$F/all.txt"
 
