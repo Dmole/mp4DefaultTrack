@@ -319,7 +319,7 @@ sub print_json_list {
         print ",\n" unless $first;
         $first = 0;
         my $lang = defined($t->{language}) ? "\"$t->{language}\"" : "null";
-        print "  {\"id\": $t->{trackId}, \"type\": \"$t->{type}\", \"lang\": $lang, \"default\": ".
+        print "\t{\"id\": $t->{trackId}, \"type\": \"$t->{type}\", \"lang\": $lang, \"default\": ".
               ($t->{defaultFlag}?"true":"false").", \"forced\": ".($t->{forcedFlag}?"true":"false")."}";
     }
     print "\n]\n";

@@ -555,7 +555,7 @@ if [ "$FILE_SIZE" -lt 64 ]; then
 fi
 
 if [ "$CMD" == "list" ]; then
-    echo "Scanning '$FILE' (Size: $FILE_SIZE bytes)..." >&2
+    #echo "Scanning '$FILE' (Size: $FILE_SIZE bytes)..." >&2
     list_tracks "$FILE" "$FILE_SIZE"
 
 elif [ "$CMD" == "set" ] || [ "$CMD" == "unset" ]; then
@@ -568,7 +568,7 @@ elif [ "$CMD" == "set" ] || [ "$CMD" == "unset" ]; then
         exit 1
     fi
     
-    echo "Scanning '$FILE' (Size: $FILE_SIZE bytes)..." >&2
+    #echo "Scanning '$FILE' (Size: $FILE_SIZE bytes)..." >&2
     
     # Start scanning from the beginning of the file (offset 0)
     iterate_atoms "$FILE" 0 "$FILE_SIZE" "find_and_patch_tkhd_callback" "$TRACK_ID" "$CMD"

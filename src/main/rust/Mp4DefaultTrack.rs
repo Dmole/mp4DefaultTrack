@@ -355,7 +355,7 @@ fn print_list(tracks: &[Track]) {
             Some(s) => format!("\"{}\"", s),
             None => "null".to_string(),
         };
-        println!("  {{\"id\": {}, \"type\": \"{}\", \"lang\": {}, \"default\": {}, \"forced\": {}}}{}",
+        println!("\t{{\"id\": {}, \"type\": \"{}\", \"lang\": {}, \"default\": {}, \"forced\": {}}}{}",
                  t.track_id,
                  typ,
                  lang,

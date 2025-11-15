@@ -299,7 +299,12 @@ function cmdList(filePath) {
     default: !!t.defaultFlag,
     forced: !!t.forcedFlag
   }));
-  console.log(JSON.stringify(out, null, 2));
+  let fo = JSON.stringify(out, null, "\t");
+  fo = fo.replace(/\n\t+/g, ' ');
+  fo = fo.replace(/ \{/g, "\n\t{");
+  fo = fo.replace(/\{ /g, '{');
+  fo = fo.replace(/ \}/g, '}');
+  console.log(fo);
 }
 
 function cmdSetUnset(cmd, filePath, tidStr, flag) {

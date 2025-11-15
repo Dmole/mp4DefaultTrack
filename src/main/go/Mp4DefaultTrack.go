@@ -73,7 +73,7 @@ func doList(path string) {
 
 	fmt.Println("[")
 	for i, t := range tracks {
-		fmt.Printf("  {\"id\": %d, \"type\": \"%s\", \"lang\": \"%s\", \"default\": %t, \"forced\": %t}",
+		fmt.Printf("\t{\"id\": %d, \"type\": \"%s\", \"lang\": \"%s\", \"default\": %t, \"forced\": %t}",
 			t.TrackId, t.Type, t.Language, t.Default, t.Forced)
 		if i != len(tracks)-1 {
 			fmt.Println(",")

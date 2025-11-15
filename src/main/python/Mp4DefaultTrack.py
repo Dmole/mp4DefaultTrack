@@ -246,7 +246,7 @@ def cmd_list(path):
     tracks = parse_mp4(path)
     print("[")
     for i, t in enumerate(tracks):
-        print(f'  {{"id": {t.track_id}, "type": "{t.type}", '
+        print(f'\t{{"id": {t.track_id}, "type": "{t.type}", '
               f'"lang": "{t.lang}", "default": {str(t.default).lower()}, '
               f'"forced": {str(t.forced).lower()}}}{"," if i < len(tracks)-1 else ""}')
     print("]")

@@ -23,10 +23,10 @@ echo "$B-$A" | bc > "$F/java_date.txt"
 
 A="$(date +%s.%N)"
 /bin/time -v target/mp4JavaTrack list "$T" \
-	> "$F/javaNative.txt" \
-	2> "$F/javaNative_time.txt"
+	> "$F/javanative.txt" \
+	2> "$F/javanative_time.txt"
 B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/javaNative_date.txt"
+echo "$B-$A" | bc > "$F/javanative_date.txt"
 
 A="$(date +%s.%N)"
 /bin/time -v target/mp4RustTrack list "$T" \
@@ -93,3 +93,17 @@ grep . "$F"/*_date.txt \
 echo '```'
 } > "$F/all.txt"
 
+MD5S="$(
+cd target/test_results
+ls -1 | grep -Pv "_|all.txt" | xargs md5sum | sort
+)"
+CS="$(echo "$MD5S" | perl -pe 's/ .*//g' | uniq -c)"
+L="$(echo "$CS" | grep -c .)"
+if [ "$L" -gt "1" ] ; then
+	while read -r CP ; do
+		C="$(echo "$CP" | perl -pe 's/^ +//g;s/ .*//g')"
+		P="$(echo "$CP" | perl -pe 's/.* //g')"
+		echo "$CP"
+		echo "$MD5S" | grep "$P" | perl -pe 's/.* //g;s/^/\t/g'
+	done  < <(echo "$CS")
+fi
