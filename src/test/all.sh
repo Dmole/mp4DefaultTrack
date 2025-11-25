@@ -14,68 +14,33 @@ mkdir -p "$F"
 T="target/test.mp4"
 sudo bash -c "sync; echo 3 > /proc/sys/vm/drop_caches"
 
-A="$(date +%s.%N)"
-/bin/time -v java -jar target/mp4JavaTrack.jar list "$T" \
-	> "$F/java.txt" \
-	2> "$F/java_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/java_date.txt"
+doit() {
+	OUT="$1"
+	shift
+	local A; A="$(date +%s.%N)"
+	/bin/time -v "$@" list "$T" \
+		> "$F/$OUT.txt" \
+		2> "$F/${OUT}_time.txt"
+	local B; B="$(date +%s.%N)"
+	echo "$B-$A" | bc > "$F/${OUT}_date.txt"
+	{
+		md5sum "$T"
+		"$@" set "$T" 3 default
+		"$@" list "$T"
+		"$@" unset "$T" 3 default
+		md5sum "$T"
+	} >> "$F/$OUT.txt"
+}
 
-A="$(date +%s.%N)"
-/bin/time -v target/mp4JavaTrack list "$T" \
-	> "$F/javanative.txt" \
-	2> "$F/javanative_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/javanative_date.txt"
-
-A="$(date +%s.%N)"
-/bin/time -v target/mp4RustTrack list "$T" \
-	> "$F/rust.txt" \
-	2> "$F/rust_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/rust_date.txt"
-
-A="$(date +%s.%N)"
-/bin/time -v target/mp4GoTrack list "$T" \
-	> "$F/go.txt" \
-	2> "$F/go_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/go_date.txt"
-
-A="$(date +%s.%N)"
-/bin/time -v target/mp4CppTrack list "$T" \
-	> "$F/cpp.txt" \
-	2> "$F/cpp_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/cpp_date.txt"
-
-A="$(date +%s.%N)"
-/bin/time -v python3 src/main/python/Mp4DefaultTrack.py list "$T" \
-	> "$F/python.txt" \
-	2> "$F/python_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/python_date.txt"
-
-A="$(date +%s.%N)"
-/bin/time -v node src/main/javascript/Mp4DefaultTrack.js list "$T" \
-	> "$F/javascript.txt" \
-	2> "$F/javascript_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/javascript_date.txt"
-
-A="$(date +%s.%N)"
-/bin/time -v perl src/main/perl/Mp4DefaultTrack.pl list "$T" \
-	> "$F/perl.txt" \
-	2> "$F/perl_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/perl_date.txt"
-
-A="$(date +%s.%N)"
-/bin/time -v bash src/main/bash/Mp4DefaultTrack.sh list "$T" \
-	> "$F/bash.txt" \
-	2> "$F/bash_time.txt"
-B="$(date +%s.%N)"
-echo "$B-$A" | bc > "$F/bash_date.txt"
+doit java java -jar target/mp4JavaTrack.jar
+doit javanative target/mp4JavaTrack
+doit rust target/mp4RustTrack
+doit go target/mp4GoTrack
+doit cpp target/mp4CppTrack
+doit python python3 src/main/python/Mp4DefaultTrack.py
+doit javascript node src/main/javascript/Mp4DefaultTrack.js
+doit perl perl src/main/perl/Mp4DefaultTrack.pl
+doit bash bash src/main/bash/Mp4DefaultTrack.sh
 
 {
 echo "### Memory Usage:"

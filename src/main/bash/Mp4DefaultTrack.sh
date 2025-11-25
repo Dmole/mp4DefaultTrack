@@ -19,11 +19,6 @@ WAS_ERR=false
 trap 'echo "ERROR: $BASH_SOURCE:$LINENO $BASH_COMMAND$(log_func)" >&2;WAS_ERR=true' ERR
 trap 'R=$?; finalize; if [ "$R" -ne 0 ] && ! $WAS_ERR ; then echo "EXIT: $BASH_SOURCE: $BASH_COMMAND$(log_func)" >&2; fi' EXIT
 
-set -u # Error on unset variables
-set -o pipefail # Exit if any part of a pipeline fails
-
-# --- Binary I/O Helper Functions using dd and od ---
-
 # read_u32_be(file, offset)
 # Reads 4 bytes at $offset from $file as a Big Endian unsigned integer
 read_u32_be() {
@@ -35,7 +30,6 @@ read_u32_be() {
         echo "Error: Read failed at offset $offset" >&2
         return 1
     fi
-    # Use 16# for hex conversion
     echo $((16#$hex))
 }
 
@@ -80,15 +74,12 @@ read_type() {
 decode_mp4_language() {
     local packed=$1
     if [ "$packed" -eq 0 ]; then
-        echo "und" # Undetermined
+        echo "und"
         return
     fi
-
-    # Each char is 5 bits, packed + 0x60
     local c1=$(( (packed >> 10) & 0x1F ))
     local c2=$(( (packed >> 5) & 0x1F ))
     local c3=$(( packed & 0x1F ))
-
     printf "\\$(printf '%03o' $((c1 + 0x60)))\\$(printf '%03o' $((c2 + 0x60)))\\$(printf '%03o' $((c3 + 0x60)))"
 }
 
@@ -107,7 +98,7 @@ iterate_atoms() {
     local start_offset="$2"
     local end_offset="$3"
     local callback="$4"
-    shift 4 # The rest of the args are context for the callback
+    shift 4
 
     local pos=$start_offset
     local stop=0
@@ -115,10 +106,8 @@ iterate_atoms() {
     while [ "$pos" -lt "$end_offset" ] && [ "$stop" -eq 0 ]; do
         local atom_size
         atom_size=$(read_u32_be "$file" "$pos")
-        
         local atom_type
         atom_type=$(read_type "$file" $((pos + 4)))
-
         local payload_offset=$((pos + 8))
 
         if [ "$atom_size" -lt 8 ]; then
@@ -128,28 +117,18 @@ iterate_atoms() {
             continue
         fi
 
-        # Note: This does NOT handle 64-bit atoms (size=1) or 'zero' atoms (size=0)
-        # which is a major limitation, but matches the simplified goal.
-        
-        # Run the callback. The callback's return value determines if we stop.
-        # We must check the return code with 'if' to prevent 'set -eE'
-        # from firing when the callback returns '1' to stop iteration.
         if ! "$callback" "$file" "$atom_type" "$atom_size" "$payload_offset" "$@" ; then
             stop=$?
         else
             stop=0
         fi
         
-        # Move to the next atom
         pos=$((pos + atom_size))
     done
 
     return $stop
 }
 
-# --- 'list' command implementation ---
-
-# Global arrays to store track info
 declare -a G_TRACK_IDS
 declare -a G_TRACK_TYPES
 declare -a G_TRACK_LANGS
@@ -168,10 +147,8 @@ list_tracks() {
     G_TRACK_FORCEDS=()
     G_TRACK_COUNT=0
 
-    # Start iteration, looking for 'moov'
     iterate_atoms "$file" 0 "$file_size" "find_moov_callback" "$file"
     
-    # Print the collected data as JSON
     echo "["
     for (( i=0; i<$G_TRACK_COUNT; i++ )); do
         local id="${G_TRACK_IDS[$i]:-0}"
@@ -200,11 +177,10 @@ find_moov_callback() {
     local payload_offset="$4"
     
     if [ "$atom_type" == "moov" ]; then
-        # Found 'moov', dive into it, looking for 'trak'
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "find_trak_callback" "$file"
-        return 1 # Stop iterating top-level atoms
+        return 1
     fi
-    return 0 # Continue
+    return 0
 }
 
 find_trak_callback() {
@@ -214,7 +190,6 @@ find_trak_callback() {
     local payload_offset="$4"
 
     if [ "$atom_type" == "trak" ]; then
-        # Found a 'trak' atom. Create a new entry for it.
         local idx=$G_TRACK_COUNT
         G_TRACK_IDS[$idx]=0
         G_TRACK_TYPES[$idx]="unknown"
@@ -222,12 +197,11 @@ find_trak_callback() {
         G_TRACK_DEFAULTS[$idx]="false"
         G_TRACK_FORCEDS[$idx]="false"
         
-        # Parse this 'trak' atom for its children ('tkhd', 'mdia')
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_trak_callback" "$file" "$idx"
         
         G_TRACK_COUNT=$((G_TRACK_COUNT + 1))
     fi
-    return 0 # Continue searching for more 'trak' atoms
+    return 0
 }
 
 parse_trak_callback() {
@@ -235,15 +209,14 @@ parse_trak_callback() {
     local atom_type="$2"
     local atom_size="$3"
     local payload_offset="$4"
-    local idx="$6" # The index of the track we're populating (was $5)
+    local idx="$6"
 
     if [ "$atom_type" == "tkhd" ]; then
         parse_tkhd "$file" "$payload_offset" "$idx"
     elif [ "$atom_type" == "mdia" ]; then
-        # Dive into 'mdia'
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_mdia_callback" "$file" "$idx"
     fi
-    return 0 # Continue parsing this 'trak'
+    return 0
 }
 
 parse_tkhd() {
@@ -251,8 +224,6 @@ parse_tkhd() {
     local payload_offset="$2"
     local idx="$3"
     
-    # [0]   : version
-    # [1-3] : flags
     local version
     version=$(read_u8 "$file" "$payload_offset")
     
@@ -282,17 +253,16 @@ parse_mdia_callback() {
     local atom_type="$2"
     local atom_size="$3"
     local payload_offset="$4"
-    local idx="$6" # (was $5)
+    local idx="$6"
 
     if [ "$atom_type" == "mdhd" ]; then
         parse_mdhd "$file" "$payload_offset" "$idx"
     elif [ "$atom_type" == "hdlr" ]; then
         parse_hdlr "$file" "$payload_offset" "$idx"
     elif [ "$atom_type" == "minf" ]; then
-        # Dive into 'minf'
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_minf_callback" "$file" "$idx"
     fi
-    return 0 # Continue parsing 'mdia'
+    return 0
 }
 
 parse_mdhd() {
@@ -305,9 +275,9 @@ parse_mdhd() {
     
     local lang_offset
     if [ "$version" -eq 1 ]; then
-        lang_offset=$((payload_offset + 28)) # version(1) + flags(3) + ctime(8) + mtime(8) + timescale(4) + duration(8)
+        lang_offset=$((payload_offset + 28))
     else
-        lang_offset=$((payload_offset + 20)) # version(1) + flags(3) + ctime(4) + mtime(4) + timescale(4) + duration(4)
+        lang_offset=$((payload_offset + 20))
     fi
     
     local lang_packed
@@ -322,7 +292,6 @@ parse_hdlr() {
     local payload_offset="$2"
     local idx="$3"
     
-    # [8-11] : handler type
     local handler_type_offset=$((payload_offset + 8))
     local type
     type=$(read_type "$file" "$handler_type_offset")
@@ -341,13 +310,12 @@ parse_minf_callback() {
     local atom_type="$2"
     local atom_size="$3"
     local payload_offset="$4"
-    local idx="$6" # (was $5)
+    local idx="$6"
 
     if [ "$atom_type" == "stbl" ]; then
-        # Dive into 'stbl'
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_stbl_callback" "$file" "$idx"
     fi
-    return 0 # Continue parsing 'minf'
+    return 0
 }
 
 parse_stbl_callback() {
@@ -355,12 +323,12 @@ parse_stbl_callback() {
     local atom_type="$2"
     local atom_size="$3"
     local payload_offset="$4"
-    local idx="$6" # (was $5)
+    local idx="$6"
 
     if [ "$atom_type" == "stsd" ]; then
         parse_stsd "$file" "$payload_offset" "$idx"
     fi
-    return 0 # Continue parsing 'stbl'
+    return 0
 }
 
 parse_stsd() {
@@ -368,18 +336,13 @@ parse_stsd() {
     local payload_offset="$2"
     local idx="$3"
     
-    # [4-7] : entry_count (stsd has version/flags, then entry_count)
     local entry_count
     entry_count=$(read_u32_be "$file" "$((payload_offset + 4))")
     
     if [ "$entry_count" -gt 0 ]; then
-        # Just check the first sample entry
-        # [8-11]  : sample_description_size
-        # [12-15] : sample_description_type (e.g., 'tx3g', 'mp4a')
         local sample_type
         sample_type=$(read_type "$file" "$((payload_offset + 12))")
         
-        # This matches the non-standard Java logic
         if [[ "$sample_type" == *"fcd "* ]]; then
             G_TRACK_FORCEDS[$idx]="true"
         else
@@ -402,19 +365,18 @@ find_and_patch_tkhd_callback() {
     local target_track_id="$5"
     local command="$6"
     
-    local found=0
-    
     if [ "$atom_type" == "moov" ] || [ "$atom_type" == "trak" ]; then
-        # Recurse into container atoms
-        iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) \
-            "find_and_patch_tkhd_callback" "$target_track_id" "$command"
-        found=$?
+        if ! iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) \
+            "find_and_patch_tkhd_callback" "$target_track_id" "$command"; then
+            return 1
+        fi
     elif [ "$atom_type" == "tkhd" ]; then
-        # Process this 'tkhd' atom
-        found=$(check_and_patch_tkhd "$file" "$payload_offset" "$target_track_id" "$command")
+        if ! check_and_patch_tkhd "$file" "$payload_offset" "$target_track_id" "$command"; then
+            return 1
+        fi
     fi
     
-    return $found # Propagate 'found' status up
+    return 0
 }
 
 # check_and_patch_tkhd(file, tkhd_payload_offset, target_track_id, command)
@@ -427,14 +389,6 @@ check_and_patch_tkhd() {
     local payload_offset="$2"
     local target_track_id="$3"
     local command="$4"
-    local found=0
-
-    # Per the Java code/MP4 spec:
-    # tkhd payload:
-    # [0]       : version (1 byte)
-    # [1-3]     : flags (3 bytes)
-    # [12-15]   : track_id (if version 0)
-    # [20-23]   : track_id (if version 1)
 
     local version
     version=$(read_u8 "$file" "$payload_offset")
@@ -452,59 +406,34 @@ check_and_patch_tkhd() {
     track_id=$(read_u32_be "$file" "$track_id_offset")
 
     if [ "$track_id" -eq "$target_track_id" ]; then
-        echo "Found track $track_id at offset $payload_offset" >&2
-
-        # Read the 3 flag bytes
         local flags_hex
         flags_hex=$(dd if="$file" bs=1 skip="$flags_offset" count=3 2>/dev/null | od -t x1 -An | tr -d ' \n')
         local flags_dec=$((16#$flags_hex))
 
         local new_flags_dec
         if [ "$command" == "set" ]; then
-            # Set the last bit ('default' flag)
             new_flags_dec=$((flags_dec | 1))
-            echo "Setting 'default' flag..." >&2
-        else # "unset"
-            # Unset the last bit
-            new_flags_dec=$((flags_dec & 0xFFFFFE)) # 0xFFFFFE is ...11111110
-            echo "Unsetting 'default' flag..." >&2
+        else
+            new_flags_dec=$((flags_dec & 0xFFFFFE))
         fi
 
-        if [ "$flags_dec" -eq "$new_flags_dec" ]; then
-            echo "Flag is already in the desired state." >&2
-            found=1
-        else
-            # Convert decimal back to 3 hex bytes
+        if [ "$flags_dec" -ne "$new_flags_dec" ]; then
             local new_flags_hex
             new_flags_hex=$(printf '%06x' $new_flags_dec)
 
-            # Extract 3 bytes from hex string
             local b1=$((16#${new_flags_hex:0:2}))
             local b2=$((16#${new_flags_hex:2:2}))
             local b3=$((16#${new_flags_hex:4:2}))
 
-            # Write the bytes back using printf and dd
-            # We must use conv=notrunc to avoid truncating the file
             printf "\\$(printf '%03o' $b1)\\$(printf '%03o' $b2)\\$(printf '%03o' $b3)" | \
                 dd of="$file" bs=1 seek="$flags_offset" count=3 conv=notrunc 2>/dev/null
-
-            if [ $? -eq 0 ]; then
-                echo "Successfully patched track $track_id." >&2
-                found=1
-            else
-                echo "Error: Failed to write to file at offset $flags_offset" >&2
-                # We'll still return 1 to stop, set -e will halt on error
-                found=1
-            fi
         fi
+        
+        return 1
     fi
 
-    # Return "found" status
-    echo "$found"
+    return 0
 }
-
-
-# --- Main Script ---
 
 if [ "$#" -lt 2 ]; then
     echo "Usage: $0 <list|set|unset> <file> [trackId]" >&2
@@ -518,7 +447,6 @@ fi
 CMD="$1"
 FILE="$2"
 
-# --- Argument Validation ---
 if [ "$CMD" != "list" ] && [ "$CMD" != "set" ] && [ "$CMD" != "unset" ]; then
     echo "Error: Command must be 'list', 'set', or 'unset'." >&2
     exit 1
@@ -546,8 +474,6 @@ if [ "$CMD" == "set" ] || [ "$CMD" == "unset" ]; then
     fi
 fi
 
-# --- Execution ---
-
 FILE_SIZE=$(stat -c%s "$FILE")
 if [ "$FILE_SIZE" -lt 64 ]; then
     echo "Error: File is too small to be a valid MP4." >&2
@@ -555,29 +481,10 @@ if [ "$FILE_SIZE" -lt 64 ]; then
 fi
 
 if [ "$CMD" == "list" ]; then
-    #echo "Scanning '$FILE' (Size: $FILE_SIZE bytes)..." >&2
     list_tracks "$FILE" "$FILE_SIZE"
 
 elif [ "$CMD" == "set" ] || [ "$CMD" == "unset" ]; then
-    echo "WARNING: This script will directly modify '$FILE'."
-    echo "Please ensure you have a backup."
-    read -p "Continue? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Operation cancelled."
-        exit 1
-    fi
-    
-    #echo "Scanning '$FILE' (Size: $FILE_SIZE bytes)..." >&2
-    
-    # Start scanning from the beginning of the file (offset 0)
-    iterate_atoms "$FILE" 0 "$FILE_SIZE" "find_and_patch_tkhd_callback" "$TRACK_ID" "$CMD"
-    FINAL_STATUS=$?
-
-    if [ "$FINAL_STATUS" -eq 1 ]; then
-        echo "Operation completed successfully." >&2
-    else
-        echo "Could not find track ID $TRACK_ID in the file." >&2
-        exit 1
+    if ! iterate_atoms "$FILE" 0 "$FILE_SIZE" "find_and_patch_tkhd_callback" "$TRACK_ID" "$CMD"; then
+        exit 0
     fi
 fi
