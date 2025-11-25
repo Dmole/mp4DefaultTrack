@@ -19,8 +19,14 @@ WAS_ERR=false
 trap 'echo "ERROR: $BASH_SOURCE:$LINENO $BASH_COMMAND$(log_func)" >&2;WAS_ERR=true' ERR
 trap 'R=$?; finalize; if [ "$R" -ne 0 ] && ! $WAS_ERR ; then echo "EXIT: $BASH_SOURCE: $BASH_COMMAND$(log_func)" >&2; fi' EXIT
 
+# Global registers for return values to avoid subshells and capture errors
+G_RET_VAL=0
+G_RET_STR=""
+G_STOP_ITER=0
+
 # read_u32_be(file, offset)
 # Reads 4 bytes at $offset from $file as a Big Endian unsigned integer
+# Sets G_RET_VAL
 read_u32_be() {
     local file="$1"
     local offset="$2"
@@ -30,11 +36,12 @@ read_u32_be() {
         echo "Error: Read failed at offset $offset" >&2
         return 1
     fi
-    echo $((16#$hex))
+    G_RET_VAL=$((16#$hex))
 }
 
 # read_u16_be(file, offset)
 # Reads 2 bytes at $offset from $file as a Big Endian unsigned integer
+# Sets G_RET_VAL
 read_u16_be() {
     local file="$1"
     local offset="$2"
@@ -44,11 +51,12 @@ read_u16_be() {
         echo "Error: Read failed at offset $offset" >&2
         return 1
     fi
-    echo $((16#$hex))
+    G_RET_VAL=$((16#$hex))
 }
 
 # read_u8(file, offset)
 # Reads 1 byte at $offset from $file
+# Sets G_RET_VAL
 read_u8() {
     local file="$1"
     local offset="$2"
@@ -58,29 +66,31 @@ read_u8() {
         echo "Error: Read failed at offset $offset" >&2
         return 1
     fi
-    echo $((16#$hex))
+    G_RET_VAL=$((16#$hex))
 }
 
 # read_type(file, offset)
 # Reads 4 bytes at $offset from $file as an ASCII string
+# Sets G_RET_STR
 read_type() {
     local file="$1"
     local offset="$2"
-    dd if="$file" bs=1 skip="$offset" count=4 2>/dev/null
+    G_RET_STR=$(dd if="$file" bs=1 skip="$offset" count=4 2>/dev/null)
 }
 
 # decode_mp4_language(packed_lang_code)
 # Decodes the 16-bit packed ISO-639-2/T language code from mdhd
+# Sets G_RET_STR
 decode_mp4_language() {
     local packed=$1
     if [ "$packed" -eq 0 ]; then
-        echo "und"
+        G_RET_STR="und"
         return
     fi
     local c1=$(( (packed >> 10) & 0x1F ))
     local c2=$(( (packed >> 5) & 0x1F ))
     local c3=$(( packed & 0x1F ))
-    printf "\\$(printf '%03o' $((c1 + 0x60)))\\$(printf '%03o' $((c2 + 0x60)))\\$(printf '%03o' $((c3 + 0x60)))"
+    G_RET_STR=$(printf "\\$(printf '%03o' $((c1 + 0x60)))\\$(printf '%03o' $((c2 + 0x60)))\\$(printf '%03o' $((c3 + 0x60)))")
 }
 
 
@@ -92,7 +102,7 @@ decode_mp4_language() {
 # Calls $callback_func for each atom:
 #   $callback_func <file> <atom_type> <atom_size> <payload_offset> <context_arg1> ...
 #
-# Returns 1 if the callback requested to stop, 0 otherwise.
+# Checks global G_STOP_ITER to determine if loop should break.
 iterate_atoms() {
     local file="$1"
     local start_offset="$2"
@@ -101,13 +111,15 @@ iterate_atoms() {
     shift 4
 
     local pos=$start_offset
-    local stop=0
+    # Note: G_STOP_ITER is NOT reset here to allow recursive stops to propagate up
 
-    while [ "$pos" -lt "$end_offset" ] && [ "$stop" -eq 0 ]; do
-        local atom_size
-        atom_size=$(read_u32_be "$file" "$pos")
-        local atom_type
-        atom_type=$(read_type "$file" $((pos + 4)))
+    while [ "$pos" -lt "$end_offset" ] && [ "${G_STOP_ITER:-0}" -eq 0 ]; do
+        read_u32_be "$file" "$pos"
+        local atom_size=$G_RET_VAL
+
+        read_type "$file" $((pos + 4))
+        local atom_type="$G_RET_STR"
+
         local payload_offset=$((pos + 8))
 
         if [ "$atom_size" -lt 8 ]; then
@@ -117,16 +129,16 @@ iterate_atoms() {
             continue
         fi
 
-        if ! "$callback" "$file" "$atom_type" "$atom_size" "$payload_offset" "$@" ; then
-            stop=$?
-        else
-            stop=0
+        # Execute callback directly (no 'if', no '$()')
+        "$callback" "$file" "$atom_type" "$atom_size" "$payload_offset" "$@"
+
+        # Check global stop flag
+        if [ "${G_STOP_ITER:-0}" -eq 1 ]; then
+            break
         fi
-        
+
         pos=$((pos + atom_size))
     done
-
-    return $stop
 }
 
 declare -a G_TRACK_IDS
@@ -139,16 +151,17 @@ declare -i G_TRACK_COUNT=0
 list_tracks() {
     local file="$1"
     local file_size="$2"
-    
+
     G_TRACK_IDS=()
     G_TRACK_TYPES=()
     G_TRACK_LANGS=()
     G_TRACK_DEFAULTS=()
     G_TRACK_FORCEDS=()
     G_TRACK_COUNT=0
+    G_STOP_ITER=0
 
     iterate_atoms "$file" 0 "$file_size" "find_moov_callback" "$file"
-    
+
     echo "["
     for (( i=0; i<$G_TRACK_COUNT; i++ )); do
         local id="${G_TRACK_IDS[$i]:-0}"
@@ -156,18 +169,16 @@ list_tracks() {
         local lang="${G_TRACK_LANGS[$i]:-und}"
         local def="${G_TRACK_DEFAULTS[$i]:-false}"
         local forced="${G_TRACK_FORCEDS[$i]:-false}"
-        
+
         local comma=","
         if [ $i -eq $((G_TRACK_COUNT - 1)) ]; then
             comma=""
         fi
-        
+
         printf "	{\"id\": %d, \"type\": \"%s\", \"lang\": \"%s\", \"default\": %s, \"forced\": %s}%s\n" \
             "$id" "$type" "$lang" "$def" "$forced" "$comma"
     done
     echo "]"
-    
-    return 0
 }
 
 find_moov_callback() {
@@ -175,12 +186,12 @@ find_moov_callback() {
     local atom_type="$2"
     local atom_size="$3"
     local payload_offset="$4"
-    
+
     if [ "$atom_type" == "moov" ]; then
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "find_trak_callback" "$file"
-        return 1
+        # Found moov, stop top-level iteration
+        G_STOP_ITER=1
     fi
-    return 0
 }
 
 find_trak_callback() {
@@ -196,12 +207,11 @@ find_trak_callback() {
         G_TRACK_LANGS[$idx]="und"
         G_TRACK_DEFAULTS[$idx]="false"
         G_TRACK_FORCEDS[$idx]="false"
-        
+
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_trak_callback" "$file" "$idx"
-        
+
         G_TRACK_COUNT=$((G_TRACK_COUNT + 1))
     fi
-    return 0
 }
 
 parse_trak_callback() {
@@ -216,36 +226,35 @@ parse_trak_callback() {
     elif [ "$atom_type" == "mdia" ]; then
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_mdia_callback" "$file" "$idx"
     fi
-    return 0
 }
 
 parse_tkhd() {
     local file="$1"
     local payload_offset="$2"
     local idx="$3"
-    
-    local version
-    version=$(read_u8 "$file" "$payload_offset")
-    
+
+    read_u8 "$file" "$payload_offset"
+    local version=$G_RET_VAL
+
     local flags_hex
     flags_hex=$(dd if="$file" bs=1 skip="$((payload_offset + 1))" count=3 2>/dev/null | od -t x1 -An | tr -d ' \n')
     local flags_dec=$((16#$flags_hex))
-    
+
     if [ $((flags_dec & 1)) -ne 0 ]; then
         G_TRACK_DEFAULTS[$idx]="true"
     else
         G_TRACK_DEFAULTS[$idx]="false"
     fi
-    
+
     local track_id_offset
     if [ "$version" -eq 1 ]; then
         track_id_offset=$((payload_offset + 20))
     else
         track_id_offset=$((payload_offset + 12))
     fi
-    
-    G_TRACK_IDS[$idx]=$(read_u32_be "$file" "$track_id_offset")
-    return 0
+
+    read_u32_be "$file" "$track_id_offset"
+    G_TRACK_IDS[$idx]=$G_RET_VAL
 }
 
 parse_mdia_callback() {
@@ -262,47 +271,43 @@ parse_mdia_callback() {
     elif [ "$atom_type" == "minf" ]; then
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_minf_callback" "$file" "$idx"
     fi
-    return 0
 }
 
 parse_mdhd() {
     local file="$1"
     local payload_offset="$2"
     local idx="$3"
-    
-    local version
-    version=$(read_u8 "$file" "$payload_offset")
-    
+
+    read_u8 "$file" "$payload_offset"
+    local version=$G_RET_VAL
+
     local lang_offset
     if [ "$version" -eq 1 ]; then
         lang_offset=$((payload_offset + 28))
     else
         lang_offset=$((payload_offset + 20))
     fi
-    
-    local lang_packed
-    lang_packed=$(read_u16_be "$file" "$lang_offset")
-    
-    G_TRACK_LANGS[$idx]=$(decode_mp4_language "$lang_packed")
-    return 0
+
+    read_u16_be "$file" "$lang_offset"
+    decode_mp4_language "$G_RET_VAL"
+    G_TRACK_LANGS[$idx]="$G_RET_STR"
 }
 
 parse_hdlr() {
     local file="$1"
     local payload_offset="$2"
     local idx="$3"
-    
+
     local handler_type_offset=$((payload_offset + 8))
-    local type
-    type=$(read_type "$file" "$handler_type_offset")
-    
+    read_type "$file" "$handler_type_offset"
+    local type="$G_RET_STR"
+
     case "$type" in
         "vide") G_TRACK_TYPES[$idx]="video" ;;
         "soun") G_TRACK_TYPES[$idx]="audio" ;;
         "subt"|"sbtl"|"text") G_TRACK_TYPES[$idx]="subtitle" ;;
         *) G_TRACK_TYPES[$idx]="$type" ;;
     esac
-    return 0
 }
 
 parse_minf_callback() {
@@ -315,7 +320,6 @@ parse_minf_callback() {
     if [ "$atom_type" == "stbl" ]; then
         iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) "parse_stbl_callback" "$file" "$idx"
     fi
-    return 0
 }
 
 parse_stbl_callback() {
@@ -328,28 +332,26 @@ parse_stbl_callback() {
     if [ "$atom_type" == "stsd" ]; then
         parse_stsd "$file" "$payload_offset" "$idx"
     fi
-    return 0
 }
 
 parse_stsd() {
     local file="$1"
     local payload_offset="$2"
     local idx="$3"
-    
-    local entry_count
-    entry_count=$(read_u32_be "$file" "$((payload_offset + 4))")
-    
+
+    read_u32_be "$file" "$((payload_offset + 4))"
+    local entry_count=$G_RET_VAL
+
     if [ "$entry_count" -gt 0 ]; then
-        local sample_type
-        sample_type=$(read_type "$file" "$((payload_offset + 12))")
-        
+        read_type "$file" "$((payload_offset + 12))"
+        local sample_type="$G_RET_STR"
+
         if [[ "$sample_type" == *"fcd "* ]]; then
             G_TRACK_FORCEDS[$idx]="true"
         else
             G_TRACK_FORCEDS[$idx]="false"
         fi
     fi
-    return 0
 }
 
 
@@ -364,34 +366,29 @@ find_and_patch_tkhd_callback() {
     local payload_offset="$4"
     local target_track_id="$5"
     local command="$6"
-    
+
     if [ "$atom_type" == "moov" ] || [ "$atom_type" == "trak" ]; then
-        if ! iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) \
-            "find_and_patch_tkhd_callback" "$target_track_id" "$command"; then
-            return 1
-        fi
+        iterate_atoms "$file" "$payload_offset" $((payload_offset + atom_size - 8)) \
+            "find_and_patch_tkhd_callback" "$target_track_id" "$command"
+
     elif [ "$atom_type" == "tkhd" ]; then
-        if ! check_and_patch_tkhd "$file" "$payload_offset" "$target_track_id" "$command"; then
-            return 1
-        fi
+        check_and_patch_tkhd "$file" "$payload_offset" "$target_track_id" "$command"
     fi
-    
-    return 0
 }
 
 # check_and_patch_tkhd(file, tkhd_payload_offset, target_track_id, command)
 #
 # This function checks a 'tkhd' atom's track ID and patches its flags
 # if it matches the target.
-# Returns 1 if patched, 0 otherwise.
+# Sets G_STOP_ITER=1 if patched.
 check_and_patch_tkhd() {
     local file="$1"
     local payload_offset="$2"
     local target_track_id="$3"
     local command="$4"
 
-    local version
-    version=$(read_u8 "$file" "$payload_offset")
+    read_u8 "$file" "$payload_offset"
+    local version=$G_RET_VAL
 
     local track_id_offset
     local flags_offset=$((payload_offset + 1))
@@ -402,8 +399,8 @@ check_and_patch_tkhd() {
         track_id_offset=$((payload_offset + 12))
     fi
 
-    local track_id
-    track_id=$(read_u32_be "$file" "$track_id_offset")
+    read_u32_be "$file" "$track_id_offset"
+    local track_id=$G_RET_VAL
 
     if [ "$track_id" -eq "$target_track_id" ]; then
         local flags_hex
@@ -428,11 +425,10 @@ check_and_patch_tkhd() {
             printf "\\$(printf '%03o' $b1)\\$(printf '%03o' $b2)\\$(printf '%03o' $b3)" | \
                 dd of="$file" bs=1 seek="$flags_offset" count=3 conv=notrunc 2>/dev/null
         fi
-        
-        return 1
-    fi
 
-    return 0
+        # Found target track, stop everything
+        G_STOP_ITER=1
+    fi
 }
 
 if [ "$#" -lt 2 ]; then
@@ -484,7 +480,12 @@ if [ "$CMD" == "list" ]; then
     list_tracks "$FILE" "$FILE_SIZE"
 
 elif [ "$CMD" == "set" ] || [ "$CMD" == "unset" ]; then
-    if ! iterate_atoms "$FILE" 0 "$FILE_SIZE" "find_and_patch_tkhd_callback" "$TRACK_ID" "$CMD"; then
+    G_STOP_ITER=0
+    iterate_atoms "$FILE" 0 "$FILE_SIZE" "find_and_patch_tkhd_callback" "$TRACK_ID" "$CMD"
+    if [ "$G_STOP_ITER" -eq 1 ]; then
         exit 0
+    else
+        echo "Could not find track ID $TRACK_ID in the file." >&2
+        exit 1
     fi
 fi
