@@ -7,27 +7,28 @@ Vibe coded like a Tony Stark wannabe.
 
 ### Memory Usage:
 ```
-2304	rust
-3796	cpp
-3864	go
-7792	bash
+2380	rust
+3716	cpp
+3868	go
+7532	bash
 9828	perl
 13560	python
-14480	javaNative
-46012	java
-48764	javascript
+14476	javanative
+36272	javascriptbun
+45924	java
+48880	javascript
 ```
 
 ### Time Usage:
 ```
-.006129694	rust
-.006690806	cpp
-.007253251	go
-.022041608	javaNative
-.029341535	perl
-.051130429	python
-.165308036	javascript
-.214280740	java
-.590205407	bash
+.008848795	rust
+.009388524	cpp
+.010262567	go
+.020712814	javanative
+.026504214	perl
+.034860370	python
+.058253227	javascriptbun
+.064468253	javascript
+.099855634	java
+.259758757	bash
 ```
-

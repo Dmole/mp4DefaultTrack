@@ -30,6 +30,7 @@ doit() {
 		"$@" unset "$T" 3 default
 		md5sum "$T"
 	} >> "$F/$OUT.txt"
+	sleep 0.1
 }
 
 doit java java -jar target/mp4JavaTrack.jar
@@ -37,8 +38,9 @@ doit javanative target/mp4JavaTrack
 doit rust target/mp4RustTrack
 doit go target/mp4GoTrack
 doit cpp target/mp4CppTrack
-doit python python3 src/main/python/Mp4DefaultTrack.py
+doit javascriptbun target/Mp4JavascriptTrack
 doit javascript node src/main/javascript/Mp4DefaultTrack.js
+doit python python3 src/main/python/Mp4DefaultTrack.py
 doit perl perl src/main/perl/Mp4DefaultTrack.pl
 doit bash bash src/main/bash/Mp4DefaultTrack.sh
 
