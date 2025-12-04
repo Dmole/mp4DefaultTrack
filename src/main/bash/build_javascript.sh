@@ -11,4 +11,5 @@ bun build src/main/javascript/Mp4DefaultTrack.js \
 	--compile \
 	--minify \
 	--optimize \
-	--outfile target/Mp4JavascriptTrack
+	--outfile target/Mp4JavascriptTrack \
+	> /dev/null
