@@ -5,4 +5,5 @@ target
 test.mp4
 Mp4DefaultTrack.jar
 Mp4DefaultTrack_fat.jar
+src/main/python/Mp4DefaultTrack.c
 mp4*Track

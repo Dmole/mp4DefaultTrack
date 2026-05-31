@@ -20,7 +20,11 @@ doit() {
 	local A; A="$(date +%s.%N)"
 	/bin/time -v "$@" list "$T" \
 		> "$F/$OUT.txt" \
-		2> "$F/${OUT}_time.txt"
+		2> "$F/${OUT}_time.txt" \
+		|| {
+			echo /bin/time -v "$@" "list \"$T\" > \"$F/$OUT.txt\" 2> \"$F/${OUT}_time.txt\""
+			exit 1
+		}
 	local B; B="$(date +%s.%N)"
 	echo "$B-$A" | bc > "$F/${OUT}_date.txt"
 	{
@@ -43,6 +47,8 @@ doit javascript node src/main/javascript/Mp4DefaultTrack.js
 doit python python3 src/main/python/Mp4DefaultTrack.py
 doit perl perl src/main/perl/Mp4DefaultTrack.pl
 doit bash bash src/main/bash/Mp4DefaultTrack.sh
+doit pythonc python3 target/mp4PythonTrack.pyc
+doit cython target/mp4CythonTrack
 
 {
 echo "### Memory Usage:"

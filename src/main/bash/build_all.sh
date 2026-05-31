@@ -12,5 +12,6 @@ bash src/main/bash/build_java_native.sh
 bash src/main/bash/build_go.sh
 bash src/main/bash/build_cpp.sh
 bash src/main/bash/build_rust.sh
+bash src/main/bash/build_python.sh
 bash src/main/bash/build_javascript.sh
 bash src/test/make_sample.sh
