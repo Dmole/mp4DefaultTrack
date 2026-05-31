@@ -1,7 +1,8 @@
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::convert::TryInto;
 
 #[derive(Default, Debug)]
 struct Track {
@@ -15,353 +16,231 @@ struct Track {
     lang: Option<String>,
 }
 
-fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf)?;
-    Ok(u32::from_be_bytes(buf))
-}
+/// Reads the next MP4 box header: returns (box_size, type_bytes, header_size).
+fn read_header(f: &mut File, max_size: u64) -> io::Result<Option<(u64, [u8; 4], u64)>> {
+    let mut header = [0u8; 8];
+    match f.read_exact(&mut header) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    
+    let mut box_size = u32::from_be_bytes(header[0..4].try_into().unwrap()) as u64;
+    let typ: [u8; 4] = header[4..8].try_into().unwrap();
+    let mut hdr_size = 8;
 
-fn read_u16<R: Read>(r: &mut R) -> io::Result<u16> {
-    let mut buf = [0u8; 2];
-    r.read_exact(&mut buf)?;
-    Ok(u16::from_be_bytes(buf))
-}
+    if box_size == 1 {
+        let mut ext = [0u8; 8];
+        f.read_exact(&mut ext)?;
+        box_size = u64::from_be_bytes(ext);
+        hdr_size = 16;
+    } else if box_size == 0 {
+        box_size = max_size; // Extends to end of file/parent container
+    }
 
-fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
-    let mut buf = [0u8; 1];
-    r.read_exact(&mut buf)?;
-    Ok(buf[0])
-}
-
-fn read_type<R: Read>(r: &mut R) -> io::Result<String> {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(Some((box_size, typ, hdr_size)))
 }
 
 fn decode_mp4_language(packed: u16) -> Option<String> {
     if packed == 0 {
         return None;
     }
-    let a = (((packed >> 10) & 0x1F) as u8 + 0x60) as char;
-    let b = (((packed >> 5) & 0x1F) as u8 + 0x60) as char;
-    let c = ((packed & 0x1F) as u8 + 0x60) as char;
-    Some(format!("{}{}{}", a, b, c))
+    let bytes = [
+        ((packed >> 10) & 0x1F) as u8 + 0x60,
+        ((packed >> 5) & 0x1F) as u8 + 0x60,
+        (packed & 0x1F) as u8 + 0x60,
+    ];
+    String::from_utf8(bytes.to_vec()).ok()
 }
 
-fn parse_mp4(path: &Path) -> io::Result<Vec<Track>> {
-    let mut f = OpenOptions::new().read(true).open(path)?;
+fn parse_mp4(f: &mut File) -> io::Result<Vec<Track>> {
     let file_len = f.seek(SeekFrom::End(0))?;
-    f.seek(SeekFrom::Start(0))?;
+    let mut tracks = Vec::new();
+    let mut offset = 0;
 
-    let mut tracks: Vec<Track> = Vec::new();
+    while offset + 8 <= file_len {
+        f.seek(SeekFrom::Start(offset))?;
+        let Some((box_size, typ, hdr_size)) = read_header(f, file_len - offset)? else { break };
+        if box_size < hdr_size { break; }
 
-    while f.stream_position()? + 8 <= file_len {
-        let start = f.stream_position()?;
-        let size = read_u32(&mut f)? as u64;
-        let typ = read_type(&mut f)?;
-        let mut box_size = size;
-        if box_size == 1 {
-            // extended size
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf)?;
-            box_size = u64::from_be_bytes(buf);
-        } else if box_size == 0 {
-            box_size = file_len - start;
+        if typ == *b"moov" {
+            parse_moov(f, offset + hdr_size, offset + box_size, &mut tracks)?;
         }
-
-        if typ == "moov" {
-            parse_moov(&mut f, start, box_size, &mut tracks)?;
-        }
-
-        if box_size < 8 {
-            break;
-        } else {
-            f.seek(SeekFrom::Start(start + box_size))?;
-        }
+        offset += box_size;
     }
 
     Ok(tracks)
 }
 
-fn parse_moov(f: &mut (impl Read + Seek), start: u64, size: u64, tracks: &mut Vec<Track>) -> io::Result<()> {
-    let end = start + size;
-    f.seek(SeekFrom::Start(start + 8))?;
-    while f.stream_position()? + 8 <= end {
-        let pos = f.stream_position()?;
-        let s = read_u32(f)? as u64;
-        let typ = read_type(f)?;
-        let mut box_size = s;
-        if box_size == 1 {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf)?;
-            box_size = u64::from_be_bytes(buf);
-        } else if box_size == 0 {
-            box_size = end - pos;
-        }
+fn parse_moov(f: &mut File, mut offset: u64, limit: u64, tracks: &mut Vec<Track>) -> io::Result<()> {
+    while offset + 8 <= limit {
+        f.seek(SeekFrom::Start(offset))?;
+        let Some((box_size, typ, hdr_size)) = read_header(f, limit - offset)? else { break };
+        if box_size < hdr_size { break; }
 
-        if typ == "trak" {
-            if let Some(t) = parse_trak(f, pos, box_size)? {
+        if typ == *b"trak" {
+            if let Some(t) = parse_trak(f, offset + hdr_size, offset + box_size)? {
                 tracks.push(t);
             }
         }
-
-        if box_size < 8 {
-            break;
-        } else {
-            f.seek(SeekFrom::Start(pos + box_size))?;
-        }
+        offset += box_size;
     }
     Ok(())
 }
 
-fn parse_trak(f: &mut (impl Read + Seek), trak_start: u64, trak_size: u64) -> io::Result<Option<Track>> {
+fn parse_trak(f: &mut File, mut offset: u64, limit: u64) -> io::Result<Option<Track>> {
     let mut info = Track::default();
-    let end = trak_start + trak_size;
-    f.seek(SeekFrom::Start(trak_start + 8))?;
-    while f.stream_position()? + 8 <= end {
-        let pos = f.stream_position()?;
-        let s = read_u32(f)? as u64;
-        let typ = read_type(f)?;
-        let mut box_size = s;
-        if box_size == 1 {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf)?;
-            box_size = u64::from_be_bytes(buf);
-        } else if box_size == 0 {
-            box_size = end - pos;
-        }
+    
+    while offset + 8 <= limit {
+        f.seek(SeekFrom::Start(offset))?;
+        let Some((box_size, typ, hdr_size)) = read_header(f, limit - offset)? else { break };
+        if box_size < hdr_size { break; }
 
-        if typ == "tkhd" {
-            info.tkhd_offset = Some(pos + 8);
-            f.seek(SeekFrom::Start(pos + 8))?;
-            let version = read_u8(f)?;
-            let flag1 = read_u8(f)?;
-            let flag2 = read_u8(f)?;
-            let flag3 = read_u8(f)?;
-            let flags = ((flag1 as u32) << 16) | ((flag2 as u32) << 8) | (flag3 as u32);
+        if typ == *b"tkhd" {
+            info.tkhd_offset = Some(offset + hdr_size);
+            f.seek(SeekFrom::Start(offset + hdr_size))?;
+            
+            let mut tkhd_data = [0u8; 4];
+            f.read_exact(&mut tkhd_data)?;
+            let version = tkhd_data[0];
+            let flags = ((tkhd_data[1] as u32) << 16) | ((tkhd_data[2] as u32) << 8) | (tkhd_data[3] as u32);
             info.default_flag = (flags & 1) != 0;
+
             if version == 1 {
-                // skip creation/modification (8 + 8), then track id
-                f.seek(SeekFrom::Current(16))?;
+                f.seek(SeekFrom::Current(16))?; // Skip creation/mod
             } else {
                 f.seek(SeekFrom::Current(8))?;
             }
-            // track id
-            let mut buf = [0u8; 4];
-            f.read_exact(&mut buf)?;
-            info.track_id = u32::from_be_bytes(buf);
-        } else if typ == "mdia" {
-            parse_mdia(f, pos, box_size, &mut info)?;
+            
+            let mut track_id_buf = [0u8; 4];
+            f.read_exact(&mut track_id_buf)?;
+            info.track_id = u32::from_be_bytes(track_id_buf);
+            
+        } else if typ == *b"mdia" {
+            parse_mdia(f, offset + hdr_size, offset + box_size, &mut info)?;
         }
-
-        if box_size < 8 {
-            break;
-        } else {
-            f.seek(SeekFrom::Start(pos + box_size))?;
-        }
+        
+        offset += box_size;
     }
 
-    if info.track_id == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(info))
-    }
+    if info.track_id != 0 { Ok(Some(info)) } else { Ok(None) }
 }
 
-fn parse_mdia(f: &mut (impl Read + Seek), mdia_start: u64, mdia_size: u64, info: &mut Track) -> io::Result<()> {
-    let end = mdia_start + mdia_size;
-    f.seek(SeekFrom::Start(mdia_start + 8))?;
-    while f.stream_position()? + 8 <= end {
-        let pos = f.stream_position()?;
-        let s = read_u32(f)? as u64;
-        let typ = read_type(f)?;
-        let mut box_size = s;
-        if box_size == 1 {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf)?;
-            box_size = u64::from_be_bytes(buf);
-        } else if box_size == 0 {
-            box_size = end - pos;
-        }
+fn parse_mdia(f: &mut File, mut offset: u64, limit: u64, info: &mut Track) -> io::Result<()> {
+    while offset + 8 <= limit {
+        f.seek(SeekFrom::Start(offset))?;
+        let Some((box_size, typ, hdr_size)) = read_header(f, limit - offset)? else { break };
+        if box_size < hdr_size { break; }
 
-        if typ == "mdhd" {
-            info.mdhd_offset = Some(pos + 8);
-            f.seek(SeekFrom::Start(pos + 8))?;
-            let version = read_u8(f)?;
-            f.seek(SeekFrom::Current(3))?; // flags
-            if version == 1 {
-                f.seek(SeekFrom::Current(8 + 8))?; // creation + modification
+        if typ == *b"mdhd" {
+            info.mdhd_offset = Some(offset + hdr_size);
+            f.seek(SeekFrom::Start(offset + hdr_size))?;
+            
+            let mut ver = [0u8; 1];
+            f.read_exact(&mut ver)?;
+            f.seek(SeekFrom::Current(3))?; // Skip flags
+            
+            if ver[0] == 1 {
+                f.seek(SeekFrom::Current(16 + 4 + 8))?; // ctime + mtime + timescale + duration
             } else {
-                f.seek(SeekFrom::Current(4 + 4))?;
+                f.seek(SeekFrom::Current(8 + 4 + 4))?;
             }
-            // timescale
-            f.seek(SeekFrom::Current(4))?;
-            // duration
-            if version == 1 {
-                f.seek(SeekFrom::Current(8))?;
-            } else {
-                f.seek(SeekFrom::Current(4))?;
-            }
-            // language (packed)
-            let lang_packed = read_u16(f)?;
-            info.lang = decode_mp4_language(lang_packed);
-        } else if typ == "hdlr" {
-            // handler: skip version+flags(4) + pre-defined (4)
-            f.seek(SeekFrom::Start(pos + 8 + 8))?; // pos + header + 8
+            
+            let mut lang_buf = [0u8; 2];
+            f.read_exact(&mut lang_buf)?;
+            info.lang = decode_mp4_language(u16::from_be_bytes(lang_buf));
+            
+        } else if typ == *b"hdlr" {
+            f.seek(SeekFrom::Start(offset + hdr_size + 8))?; // pos + version+flags(4) + pre-defined(4)
             let mut hbuf = [0u8; 4];
             f.read_exact(&mut hbuf)?;
-            let subtype = String::from_utf8_lossy(&hbuf).into_owned();
-            if subtype == "vide" {
-                info.typ = Some("video".to_string());
-            } else if subtype == "soun" {
-                info.typ = Some("audio".to_string());
-            } else if subtype == "subt" || subtype == "sbtl" || subtype == "text" {
-                info.typ = Some("subtitle".to_string());
-            } else {
-                info.typ = Some(subtype);
-            }
-        } else if typ == "minf" {
-            parse_minf(f, pos, box_size, info)?;
+            info.typ = Some(match &hbuf {
+                b"vide" => "video".to_string(),
+                b"soun" => "audio".to_string(),
+                b"subt" | b"sbtl" | b"text" => "subtitle".to_string(),
+                _ => String::from_utf8_lossy(&hbuf).into_owned(),
+            });
+            
+        } else if typ == *b"minf" {
+            parse_minf(f, offset + hdr_size, offset + box_size, info)?;
         }
-
-        if box_size < 8 {
-            break;
-        } else {
-            f.seek(SeekFrom::Start(pos + box_size))?;
-        }
+        offset += box_size;
     }
     Ok(())
 }
 
-fn parse_minf(f: &mut (impl Read + Seek), minf_start: u64, minf_size: u64, info: &mut Track) -> io::Result<()> {
-    let end = minf_start + minf_size;
-    f.seek(SeekFrom::Start(minf_start + 8))?;
-    while f.stream_position()? + 8 <= end {
-        let pos = f.stream_position()?;
-        let s = read_u32(f)? as u64;
-        let typ = read_type(f)?;
-        let mut box_size = s;
-        if box_size == 1 {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf)?;
-            box_size = u64::from_be_bytes(buf);
-        } else if box_size == 0 {
-            box_size = end - pos;
-        }
+fn parse_minf(f: &mut File, mut offset: u64, limit: u64, info: &mut Track) -> io::Result<()> {
+    while offset + 8 <= limit {
+        f.seek(SeekFrom::Start(offset))?;
+        let Some((box_size, typ, hdr_size)) = read_header(f, limit - offset)? else { break };
+        if box_size < hdr_size { break; }
 
-        if typ == "stbl" {
-            parse_stbl(f, pos, box_size, info)?;
+        if typ == *b"stbl" {
+            parse_stbl(f, offset + hdr_size, offset + box_size, info)?;
         }
-
-        if box_size < 8 {
-            break;
-        } else {
-            f.seek(SeekFrom::Start(pos + box_size))?;
-        }
+        offset += box_size;
     }
     Ok(())
 }
 
-fn parse_stbl(f: &mut (impl Read + Seek), stbl_start: u64, stbl_size: u64, info: &mut Track) -> io::Result<()> {
-    let end = stbl_start + stbl_size;
-    f.seek(SeekFrom::Start(stbl_start + 8))?;
-    while f.stream_position()? + 8 <= end {
-        let pos = f.stream_position()?;
-        let s = read_u32(f)? as u64;
-        let typ = read_type(f)?;
-        let mut box_size = s;
-        if box_size == 1 {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf)?;
-            box_size = u64::from_be_bytes(buf);
-        } else if box_size == 0 {
-            box_size = end - pos;
-        }
+fn parse_stbl(f: &mut File, mut offset: u64, limit: u64, info: &mut Track) -> io::Result<()> {
+    while offset + 8 <= limit {
+        f.seek(SeekFrom::Start(offset))?;
+        let Some((box_size, typ, hdr_size)) = read_header(f, limit - offset)? else { break };
+        if box_size < hdr_size { break; }
 
-        if typ == "stsd" {
-            info.stsd_offset = Some(pos + 8);
-            // read version+flags(4) and entry count(4)
-            f.seek(SeekFrom::Start(pos + 8 + 8))?;
+        if typ == *b"stsd" {
+            info.stsd_offset = Some(offset + hdr_size);
+            f.seek(SeekFrom::Start(offset + hdr_size + 8))?; // Skip version+flags + entry count
+            
             let mut entry_header = [0u8; 8];
             if f.read_exact(&mut entry_header).is_ok() {
-                let sample_type = String::from_utf8_lossy(&entry_header[4..8]).to_lowercase();
-                if sample_type.contains("fcd") {
-                    info.forced_flag = true;
-                } else {
-                    info.forced_flag = false;
-                }
+                let sample_type = &entry_header[4..8];
+                // Zero allocation forced-flag check
+                info.forced_flag = sample_type[0..3].eq_ignore_ascii_case(b"fcd") 
+                                || sample_type[1..4].eq_ignore_ascii_case(b"fcd");
             }
         }
-
-        if box_size < 8 {
-            break;
-        } else {
-            f.seek(SeekFrom::Start(pos + box_size))?;
-        }
+        offset += box_size;
     }
     Ok(())
 }
 
-fn patch_tkhd_flag(path: &Path, tkhd_offset: u64, set: bool) -> io::Result<()> {
-    let mut f = OpenOptions::new().read(true).write(true).open(path)?;
-    // flags are bytes 1..3 of tkhd (we are at tkhd payload start)
+fn patch_tkhd_flag(f: &mut File, tkhd_offset: u64, set: bool) -> io::Result<()> {
     f.seek(SeekFrom::Start(tkhd_offset + 1))?;
     let mut b = [0u8; 3];
     f.read_exact(&mut b)?;
     let mut flags = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
-    if set {
-        flags |= 1;
-    } else {
-        flags &= !1;
-    }
-    let out = [( (flags >> 16) & 0xff) as u8, ((flags >> 8) & 0xff) as u8, (flags & 0xff) as u8];
+    
+    if set { flags |= 1; } else { flags &= !1; }
+    
+    let out = [((flags >> 16) & 0xff) as u8, ((flags >> 8) & 0xff) as u8, (flags & 0xff) as u8];
     f.seek(SeekFrom::Start(tkhd_offset + 1))?;
     f.write_all(&out)?;
     Ok(())
 }
 
-fn patch_stsd_forced(path: &Path, stsd_offset: u64, set: bool) -> io::Result<()> {
-    let mut f = OpenOptions::new().read(true).write(true).open(path)?;
-    // seek to first sample entry header (stsd_offset + 8 is start of version+flags+entryCount)
-    // after that comes sample entry header: 4 bytes size, 4 bytes type
-    let entry_header_pos = stsd_offset + 8 + 8;
-    f.seek(SeekFrom::Start(entry_header_pos))?;
-    let mut header = [0u8; 8];
-    f.read_exact(&mut header)?;
-    // let sample_type = [header[4], header[5], header[6], header[7]];
-    // let sample_str = String::from_utf8_lossy(&sample_type).into_owned();
+fn patch_stsd_forced(f: &mut File, stsd_offset: u64, set: bool) -> io::Result<()> {
     if set {
-        // write "fcd " as marker if possible
-        let new = b"fcd ";
+        let entry_header_pos = stsd_offset + 16;
         f.seek(SeekFrom::Start(entry_header_pos + 4))?;
-        f.write_all(new)?;
-    } else {
-        // don't know original; best-effort: if it's "fcd " leave as-is, otherwise do nothing
-        // (we could store original somewhere; left simple)
-        // do nothing
+        f.write_all(b"fcd ")?;
     }
     Ok(())
 }
 
 fn print_list(tracks: &[Track]) {
     println!("[");
+    let len = tracks.len();
     for (i, t) in tracks.iter().enumerate() {
-        let typ = match &t.typ {
-            Some(s) => s.clone(),
-            None => "unknown".to_string(),
-        };
+        let typ = t.typ.as_deref().unwrap_or("unknown");
         let lang = match &t.lang {
             Some(s) => format!("\"{}\"", s),
             None => "null".to_string(),
         };
+        let comma = if i + 1 == len { "" } else { "," };
         println!("\t{{\"id\": {}, \"type\": \"{}\", \"lang\": {}, \"default\": {}, \"forced\": {}}}{}",
-                 t.track_id,
-                 typ,
-                 lang,
-                 if t.default_flag { "true" } else { "false" },
-                 if t.forced_flag { "true" } else { "false" },
-                 if i + 1 == tracks.len() { "" } else { "," });
+                 t.track_id, typ, lang, t.default_flag, t.forced_flag, comma);
     }
     println!("]");
 }
@@ -375,21 +254,30 @@ fn main() {
 
     let cmd = &args[1];
     let path = Path::new(&args[2]);
+    let is_list = cmd == "list";
+    let set_flag = cmd == "set";
 
-    if cmd == "list" {
-        match parse_mp4(path) {
-            Ok(tracks) => {
-                print_list(&tracks);
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("Error parsing file: {}", e);
-                std::process::exit(1);
-            }
+    let mut file = match OpenOptions::new().read(true).write(!is_list).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error opening file: {}", e);
+            std::process::exit(1);
         }
+    };
+
+    let tracks = match parse_mp4(&mut file) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error parsing file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if is_list {
+        print_list(&tracks);
+        std::process::exit(0);
     }
 
-    // set/unset require more args
     if args.len() < 5 {
         eprintln!("Usage: {} set|unset <file> <trackId> <default|forced>", args[0]);
         std::process::exit(2);
@@ -403,39 +291,24 @@ fn main() {
         }
     };
     let flag = &args[4];
-    let set_flag = cmd == "set";
-
-    let tracks = match parse_mp4(path) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error parsing file: {}", e);
-            std::process::exit(1);
-        }
-    };
 
     let mut found = false;
-    for t in &tracks {
+    for t in tracks {
         if t.track_id == tid {
             found = true;
             if flag == "default" {
                 if let Some(off) = t.tkhd_offset {
-                    if let Err(e) = patch_tkhd_flag(path, off, set_flag) {
+                    if let Err(e) = patch_tkhd_flag(&mut file, off, set_flag) {
                         eprintln!("Error patching tkhd: {}", e);
                         std::process::exit(1);
                     }
-                } else {
-                    eprintln!("No tkhd offset for track {}", tid);
-                    std::process::exit(1);
                 }
             } else if flag == "forced" {
                 if let Some(off) = t.stsd_offset {
-                    if let Err(e) = patch_stsd_forced(path, off, set_flag) {
+                    if let Err(e) = patch_stsd_forced(&mut file, off, set_flag) {
                         eprintln!("Error patching stsd: {}", e);
                         std::process::exit(1);
                     }
-                } else {
-                    eprintln!("No stsd offset for track {}", tid);
-                    std::process::exit(1);
                 }
             } else {
                 eprintln!("Unknown flag: {}", flag);
@@ -449,6 +322,4 @@ fn main() {
         eprintln!("Track {} not found", tid);
         std::process::exit(1);
     }
-
-    std::process::exit(0);
 }

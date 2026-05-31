@@ -1,28 +1,69 @@
 #!/usr/bin/env python3
 import sys
-import struct
+import mmap
+import json
+
+# ----------------------------
+#   Constants
+# ----------------------------
+# Comparing raw bytes is dramatically faster than string decoding
+B_MOOV = b"moov"
+B_TRAK = b"trak"
+B_TKHD = b"tkhd"
+B_MDIA = b"mdia"
+B_MDHD = b"mdhd"
+B_HDLR = b"hdlr"
+B_MINF = b"minf"
+B_STBL = b"stbl"
+B_STSD = b"stsd"
+B_VIDE = b"vide"
+B_SOUN = b"soun"
+B_SUBT = b"subt"
+B_SBTL = b"sbtl"
+B_TEXT = b"text"
+B_FCD_ = b"fcd "
 
 # ----------------------------
 #   Helpers
 # ----------------------------
 
-def read_u32(f):
-    return struct.unpack(">I", f.read(4))[0]
-
-def read_type(f):
-    return f.read(4).decode("ascii")
-
 def decode_language(bits):
     if bits == 0:
         return None
-    return "".join(chr(((bits >> shift) & 0x1F) + 0x60)
-                   for shift in (10, 5, 0))
+    return "".join(chr(((bits >> shift) & 0x1F) + 0x60) for shift in (10, 5, 0))
+
+def iter_boxes(mm, start, end):
+    """Yields (payload_offset, header_length, total_box_size, box_type_bytes)"""
+    pos = start
+    while pos + 8 <= end:
+        # Native int.from_bytes is significantly faster than struct.unpack
+        s = int.from_bytes(mm[pos:pos+4], 'big')
+        typ = mm[pos+4:pos+8]
+        box_size = s
+        hdr_len = 8
+
+        if s == 1:
+            if pos + 16 > end:
+                break
+            box_size = int.from_bytes(mm[pos+8:pos+16], 'big')
+            hdr_len = 16
+        elif s == 0:
+            box_size = end - pos
+
+        if box_size < 8:
+            break
+
+        yield pos, hdr_len, box_size, typ
+        pos += box_size
 
 # ----------------------------
 # TrackInfo
 # ----------------------------
 
 class Track:
+    # __slots__ strictly bounds the memory footprint of the objects
+    __slots__ = ['tkhd_offset', 'stsd_offset', 'mdhd_offset', 'track_id', 'default', 'forced', 'type', 'lang']
+
     def __init__(self):
         self.tkhd_offset = None
         self.stsd_offset = None
@@ -37,234 +78,134 @@ class Track:
 # Main parsing
 # ----------------------------
 
-def parse_mp4(file_path):
+def parse_mp4(mm):
     tracks = []
-    with open(file_path, "rb") as f:
-        file_len = f.seek(0, 2)
-        f.seek(0)
-
-        while f.tell() + 8 <= file_len:
-            pos = f.tell()
-            size = read_u32(f)
-            typ  = read_type(f)
-
-            if size == 1:
-                size = struct.unpack(">Q", f.read(8))[0]
-            elif size == 0:
-                size = file_len - pos
-
-            if typ == "moov":
-                parse_moov(f, pos, size, tracks)
-
-            if size < 8:
-                break
-            f.seek(pos + size)
-
+    for pos, hdr, size, typ in iter_boxes(mm, 0, len(mm)):
+        if typ == B_MOOV:
+            parse_moov(mm, pos + hdr, pos + size, tracks)
     return tracks
 
-
-def parse_moov(f, start, size, tracks):
-    end = start + size
-    f.seek(start + 8)
-
-    while f.tell() + 8 <= end:
-        pos = f.tell()
-        s = read_u32(f)
-        typ = read_type(f)
-        if s == 1:
-            s = struct.unpack(">Q", f.read(8))[0]
-        elif s == 0:
-            s = end - pos
-
-        if typ == "trak":
-            t = parse_trak(f, pos, s)
-            if t:
+def parse_moov(mm, start, end, tracks):
+    for pos, hdr, size, typ in iter_boxes(mm, start, end):
+        if typ == B_TRAK:
+            t = parse_trak(mm, pos + hdr, pos + size)
+            if t and t.track_id != 0:
                 tracks.append(t)
 
-        if s < 8:
-            break
-        f.seek(pos + s)
-
-
-def parse_trak(f, start, size):
-    end = start + size
+def parse_trak(mm, start, end):
     t = Track()
-
-    f.seek(start + 8)
-    while f.tell() + 8 <= end:
-        pos = f.tell()
-        s = read_u32(f)
-        typ = read_type(f)
-        if s == 1:
-            s = struct.unpack(">Q", f.read(8))[0]
-        elif s == 0:
-            s = end - pos
-
-        if typ == "tkhd":
-            t.tkhd_offset = pos + 8
-            f.seek(t.tkhd_offset)
-            version = f.read(1)[0]
-            flags = struct.unpack(">I", b'\x00' + f.read(3))[0]
+    for pos, hdr, size, typ in iter_boxes(mm, start, end):
+        if typ == B_TKHD:
+            t.tkhd_offset = pos + hdr
+            version = mm[t.tkhd_offset]
+            flags = int.from_bytes(mm[t.tkhd_offset+1:t.tkhd_offset+4], 'big')
             t.default = bool(flags & 1)
 
-            if version == 1:
-                f.seek(16, 1)
-            else:
-                f.seek(8, 1)
+            skip = 16 if version == 1 else 8
+            id_pos = t.tkhd_offset + 4 + skip
+            t.track_id = int.from_bytes(mm[id_pos:id_pos+4], 'big')
 
-            t.track_id = struct.unpack(">I", f.read(4))[0]
+        elif typ == B_MDIA:
+            parse_mdia(mm, pos + hdr, pos + size, t)
+    return t
 
-        elif typ == "mdia":
-            parse_mdia(f, pos, s, t)
-
-        if s < 8:
-            break
-        f.seek(pos + s)
-
-    return t if t.track_id != 0 else None
-
-
-def parse_mdia(f, start, size, t):
-    end = start + size
-    f.seek(start + 8)
-
-    while f.tell() + 8 <= end:
-        pos = f.tell()
-        s = read_u32(f)
-        typ = read_type(f)
-
-        if s < 8:
-            break
-
-        if typ == "mdhd":
-            t.mdhd_offset = pos + 8
-            f.seek(t.mdhd_offset)
-            version = f.read(1)[0]
-            f.seek(3, 1)
-            if version == 1:
-                f.seek(8 + 8, 1)
-            else:
-                f.seek(4 + 4, 1)
-            f.seek(4, 1)
-            duration = None
-            if version == 1:
-                f.seek(8, 1)
-            else:
-                f.seek(4, 1)
-            lang_bits = struct.unpack(">H", f.read(2))[0]
+def parse_mdia(mm, start, end, t):
+    for pos, hdr, size, typ in iter_boxes(mm, start, end):
+        if typ == B_MDHD:
+            t.mdhd_offset = pos + hdr
+            version = mm[t.mdhd_offset]
+            skip = 28 if version == 1 else 16
+            lang_pos = t.mdhd_offset + 4 + skip
+            lang_bits = int.from_bytes(mm[lang_pos:lang_pos+2], 'big')
             t.lang = decode_language(lang_bits)
 
-        elif typ == "hdlr":
-            f.seek(pos + 16)
-            subtype = f.read(4).decode("ascii")
-            if subtype == "vide":
+        elif typ == B_HDLR:
+            subtype = mm[pos + hdr + 8 : pos + hdr + 12]
+            if subtype == B_VIDE:
                 t.type = "video"
-            elif subtype == "soun":
+            elif subtype == B_SOUN:
                 t.type = "audio"
-            elif subtype in ("subt", "sbtl", "text"):
+            elif subtype in (B_SUBT, B_SBTL, B_TEXT):
                 t.type = "subtitle"
             else:
-                t.type = subtype
+                t.type = subtype.decode("ascii", errors="ignore")
 
-        elif typ == "minf":
-            parse_minf(f, pos, s, t)
+        elif typ == B_MINF:
+            parse_minf(mm, pos + hdr, pos + size, t)
 
-        f.seek(pos + s)
+def parse_minf(mm, start, end, t):
+    for pos, hdr, size, typ in iter_boxes(mm, start, end):
+        if typ == B_STBL:
+            parse_stbl(mm, pos + hdr, pos + size, t)
 
-
-def parse_minf(f, start, size, t):
-    end = start + size
-    f.seek(start + 8)
-
-    while f.tell() + 8 <= end:
-        pos = f.tell()
-        s = read_u32(f)
-        typ = read_type(f)
-
-        if typ == "stbl":
-            parse_stbl(f, pos, s, t)
-
-        f.seek(pos + s)
-
-
-def parse_stbl(f, start, size, t):
-    end = start + size
-    f.seek(start + 8)
-
-    # find stsd
-    while f.tell() + 8 <= end:
-        pos = f.tell()
-        s = read_u32(f)
-        typ = read_type(f)
-
-        if typ == "stsd":
-            t.stsd_offset = pos + 8
-            f.seek(t.stsd_offset + 8)
-            entry = f.read(8)
-            if len(entry) == 8:
-                sample_type = entry[4:8].decode("ascii").lower()
-                t.forced = "fcd" in sample_type
-
-        f.seek(pos + s)
-
+def parse_stbl(mm, start, end, t):
+    for pos, hdr, size, typ in iter_boxes(mm, start, end):
+        if typ == B_STSD:
+            t.stsd_offset = pos + hdr
+            entry_start = t.stsd_offset + 8
+            if entry_start + 8 <= pos + size:
+                sample_type = mm[entry_start+4:entry_start+8].lower()
+                t.forced = b"fcd" in sample_type
 
 # ----------------------------
 # Write operations
 # ----------------------------
 
-def patch_default_flag(path, offset, value):
-    with open(path, "r+b") as f:
-        f.seek(offset + 1)
-        b1, b2, b3 = f.read(3)
-        flags = (b1 << 16) | (b2 << 8) | b3
-        if value:
-            flags |= 1
-        else:
-            flags &= ~1
-        f.seek(offset + 1)
-        f.write(bytes([(flags >> 16) & 0xFF,
-                       (flags >> 8) & 0xFF,
-                       flags & 0xFF]))
+def patch_default_flag(mm, offset, value):
+    flags = int.from_bytes(mm[offset+1:offset+4], 'big')
+    if value:
+        flags |= 1
+    else:
+        flags &= ~1
+    mm[offset+1:offset+4] = flags.to_bytes(3, 'big')
 
-
-def patch_forced_flag(path, offset, value):
-    with open(path, "r+b") as f:
-        f.seek(offset + 8)
-        entry = f.read(8)
-        sample = entry[4:8].decode("ascii")
-        if value:
-            sample = "fcd "
-        f.seek(offset + 12)
-        f.write(sample.encode("ascii"))
-
+def patch_forced_flag(mm, offset, value):
+    # If unsetting, original string type is unknown, ignore safely
+    if value:
+        mm[offset+12:offset+16] = B_FCD_
 
 # ----------------------------
 # Commands
 # ----------------------------
 
 def cmd_list(path):
-    tracks = parse_mp4(path)
+    with open(path, "rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            tracks = parse_mp4(mm)
+
+    out = []
+    for t in tracks:
+        out.append({
+            "id": t.track_id,
+            "type": t.type,
+            "lang": t.lang,
+            "default": t.default,
+            "forced": t.forced
+        })
+
+    # Mirrors original JSON spacing output but heavily optimized
     print("[")
-    for i, t in enumerate(tracks):
-        print(f'\t{{"id": {t.track_id}, "type": "{t.type}", '
-              f'"lang": "{t.lang}", "default": {str(t.default).lower()}, '
-              f'"forced": {str(t.forced).lower()}}}{"," if i < len(tracks)-1 else ""}')
+    for i, obj in enumerate(out):
+        line = json.dumps(obj)
+        print(f"\t{line}{',' if i < len(out)-1 else ''}")
     print("]")
 
 
 def cmd_setunset(path, track_id, flag, value):
-    tracks = parse_mp4(path)
-    for t in tracks:
-        if t.track_id == track_id:
-            if flag == "default":
-                patch_default_flag(path, t.tkhd_offset, value)
-            elif flag == "forced":
-                patch_forced_flag(path, t.stsd_offset, value)
-            else:
-                sys.exit("Unknown flag.")
-            return
+    # Open once in r+b mode and map with ACCESS_WRITE to modify the file directly
+    with open(path, "r+b") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+            tracks = parse_mp4(mm)
+            for t in tracks:
+                if t.track_id == track_id:
+                    if flag == "default":
+                        patch_default_flag(mm, t.tkhd_offset, value)
+                    elif flag == "forced":
+                        patch_forced_flag(mm, t.stsd_offset, value)
+                    else:
+                        sys.exit("Unknown flag.")
+                    return
     print("Track not found.")
-
 
 # ----------------------------
 # Entry point
@@ -272,25 +213,26 @@ def cmd_setunset(path, track_id, flag, value):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: mp4track.py <list|set|unset> <file> [trackId] [default|forced]")
-        sys.exit(1)
+        sys.exit("Usage: mp4track.py <list|set|unset> <file> [trackId] [default|forced]")
 
     cmd = sys.argv[1]
     path = sys.argv[2]
 
-    if cmd == "list":
-        cmd_list(path)
-        sys.exit(0)
+    try:
+        if cmd == "list":
+            cmd_list(path)
+            sys.exit(0)
 
-    if cmd in ("set", "unset"):
-        if len(sys.argv) < 5:
-            sys.exit("Missing args: set/unset <file> <trackId> <default|forced>")
+        if cmd in ("set", "unset"):
+            if len(sys.argv) < 5:
+                sys.exit("Missing args: set/unset <file> <trackId> <default|forced>")
 
-        tid = int(sys.argv[3])
-        flag = sys.argv[4]
-        val = (cmd == "set")
-        cmd_setunset(path, tid, flag, val)
-        sys.exit(0)
+            tid = int(sys.argv[3])
+            flag = sys.argv[4]
+            val = (cmd == "set")
+            cmd_setunset(path, tid, flag, val)
+            sys.exit(0)
 
-    sys.exit("Unknown command.")
-
+        sys.exit("Unknown command.")
+    except FileNotFoundError:
+        sys.exit("File not found.")

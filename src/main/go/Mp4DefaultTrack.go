@@ -1,21 +1,22 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 )
 
 type TrackInfo struct {
 	TkhdOffset int64
 	StsdOffset int64
 	MdhdOffset int64
-	TrackId    int
-	Default    bool
-	Forced     bool
+	TrackId    uint32
 	Type       string
 	Language   string
+	Default    bool
+	Forced     bool
+	Valid      bool
 }
 
 func main() {
@@ -27,12 +28,13 @@ func main() {
 	cmd := os.Args[1]
 	file := os.Args[2]
 
-	var trackId int
+	var trackId uint32
 	flag := "default"
 	hasId := false
 
 	if len(os.Args) >= 4 {
-		if v, err := atoi(os.Args[3]); err == nil {
+		var v uint32
+		if _, err := fmt.Sscan(os.Args[3], &v); err == nil {
 			trackId = v
 			hasId = true
 		}
@@ -59,17 +61,51 @@ func main() {
 	}
 }
 
-func atoi(s string) (int, error) {
-	var v int
-	_, err := fmt.Sscan(s, &v)
-	return v, err
+// ---------------------------------------------------------
+// Fast-Path Binary Decoders 
+// ---------------------------------------------------------
+
+func readU16(b []byte, off int64) uint16 {
+	b = b[off : off+2]
+	_ = b[1]
+	return uint16(b[0])<<8 | uint16(b[1])
 }
 
+func readU32(b []byte, off int64) uint32 {
+	b = b[off : off+4]
+	_ = b[3]
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+func readU64(b []byte, off int64) uint64 {
+	b = b[off : off+8]
+	_ = b[7]
+	return uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
+		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
+}
+
+func decodeLanguage(bits uint16) string {
+	if bits == 0 || bits == 0x7FFF {
+		return ""
+	}
+	c1 := (bits>>10)&31 + 0x60
+	c2 := (bits>>5)&31 + 0x60
+	c3 := bits&31 + 0x60
+	return string([]byte{byte(c1), byte(c2), byte(c3)})
+}
+
+// ---------------------------------------------------------
+// High-Speed Zero-Copy Parsers
+// ---------------------------------------------------------
+
 func doList(path string) {
-	tracks, err := readTracks(path)
+	data, unmap, err := mapFile(path)
 	if err != nil {
 		panic(err)
 	}
+	defer unmap()
+
+	tracks := readTracks(data)
 
 	fmt.Println("[")
 	for i, t := range tracks {
@@ -84,88 +120,88 @@ func doList(path string) {
 	fmt.Println("]")
 }
 
-func doSetUnset(path string, id int, flag string, val bool) {
-	tracks, err := readTracks(path)
+func doSetUnset(path string, id uint32, flag string, val bool) {
+	data, unmap, err := mapFile(path)
 	if err != nil {
 		panic(err)
 	}
+	
+	tracks := readTracks(data)
+	unmap() // Unmap immediately so we safely write to the file below
 
+	var target *TrackInfo
+	for i := range tracks {
+		if tracks[i].TrackId == id {
+			target = &tracks[i]
+			break
+		}
+	}
+
+	if target == nil {
+		panic("Track not found")
+	}
+
+	// Open file synchronously for atomic 3-byte writes.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		panic(err)
 	}
 	defer f.Close()
 
-	for _, t := range tracks {
-		if t.TrackId != id {
-			continue
-		}
-
-		if flag == "default" {
-			patchTkhdFlag(f, t.TkhdOffset, val)
-		} else if flag == "forced" {
-			patchStsdFlag(f, t.StsdOffset, val)
-		} else {
-			panic("Unknown flag: " + flag)
-		}
+	if flag == "default" {
+		patchTkhdFlag(f, target.TkhdOffset, val)
+	} else if flag == "forced" {
+		patchStsdFlag(f, target.StsdOffset, val)
+	} else {
+		panic("Unknown flag: " + flag)
 	}
+	
+	f.Sync() // Guarantee changes hit disk before test md5 runs
 }
 
-func readTracks(path string) ([]*TrackInfo, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	stat, _ := f.Stat()
-	fileLen := stat.Size()
-
-	var tracks []*TrackInfo
-
+func readTracks(data []byte) []TrackInfo {
+	var tracks []TrackInfo
 	var pos int64 = 0
-	for pos+8 <= fileLen {
-		size, _ := readU32At(f, pos)
-		typ, _ := readTypeAt(f, pos+4)
+	fileLen := int64(len(data))
 
-		boxSize := int64(size)
-		if size == 1 {
-			ext, _ := readU64At(f, pos+8)
-			boxSize = int64(ext)
-		} else if size == 0 {
+	for pos+8 <= fileLen {
+		sz := readU32(data, pos)
+		typ := string(data[pos+4 : pos+8]) // Go compiler zero-allocates this equality check
+
+		boxSize := int64(sz)
+		if sz == 1 {
+			boxSize = int64(readU64(data, pos+8))
+		} else if sz == 0 {
 			boxSize = fileLen - pos
 		}
+
 		if typ == "moov" {
-			parseMoov(f, pos, boxSize, &tracks)
+			parseMoov(data, pos, boxSize, &tracks)
 		}
 		if boxSize < 8 {
 			break
 		}
 		pos += boxSize
 	}
-
-	return tracks, nil
+	return tracks
 }
 
-func parseMoov(f *os.File, start int64, size int64, tracks *[]*TrackInfo) {
+func parseMoov(data []byte, start, size int64, tracks *[]TrackInfo) {
 	end := start + size
 	pos := start + 8
-
 	for pos+8 <= end {
-		sz, _ := readU32At(f, pos)
-		typ, _ := readTypeAt(f, pos+4)
-
+		sz := readU32(data, pos)
+		typ := string(data[pos+4 : pos+8])
 		boxSize := int64(sz)
 		if sz == 1 {
-			ext, _ := readU64At(f, pos+8)
-			boxSize = int64(ext)
+			boxSize = int64(readU64(data, pos+8))
 		} else if sz == 0 {
 			boxSize = end - pos
 		}
 
 		if typ == "trak" {
-			info := parseTrak(f, pos, boxSize)
-			if info != nil {
+			info := parseTrak(data, pos, boxSize)
+			if info.Valid {
 				*tracks = append(*tracks, info)
 			}
 		}
@@ -176,28 +212,26 @@ func parseMoov(f *os.File, start int64, size int64, tracks *[]*TrackInfo) {
 	}
 }
 
-func parseTrak(f *os.File, start int64, size int64) *TrackInfo {
-	info := &TrackInfo{}
+func parseTrak(data []byte, start, size int64) TrackInfo {
+	var info TrackInfo
 	end := start + size
 	pos := start + 8
 
 	for pos+8 <= end {
-		sz, _ := readU32At(f, pos)
-		typ, _ := readTypeAt(f, pos+4)
-
+		sz := readU32(data, pos)
+		typ := string(data[pos+4 : pos+8])
 		boxSize := int64(sz)
 		if sz == 1 {
-			ext, _ := readU64At(f, pos+8)
-			boxSize = int64(ext)
+			boxSize = int64(readU64(data, pos+8))
 		} else if sz == 0 {
 			boxSize = end - pos
 		}
 
 		if typ == "tkhd" {
 			info.TkhdOffset = pos + 8
-			parseTkhd(f, pos, boxSize, info)
+			parseTkhd(data, pos, &info)
 		} else if typ == "mdia" {
-			parseMdia(f, pos, boxSize, info)
+			parseMdia(data, pos, boxSize, &info)
 		}
 
 		if boxSize < 8 {
@@ -206,18 +240,16 @@ func parseTrak(f *os.File, start int64, size int64) *TrackInfo {
 		pos += boxSize
 	}
 
-	if info.TrackId == 0 {
-		return nil
+	if info.TrackId != 0 {
+		info.Valid = true
 	}
 	return info
 }
 
-func parseTkhd(f *os.File, start int64, size int64, info *TrackInfo) {
-	version, _ := readU8At(f, start+8)
-	f1, _ := readU8At(f, start+9)
-	f2, _ := readU8At(f, start+10)
-	f3, _ := readU8At(f, start+11)
-	flags := int((int(f1) << 16) | (int(f2) << 8) | int(f3))
+func parseTkhd(data []byte, start int64, info *TrackInfo) {
+	version := data[start+8]
+	f1, f2, f3 := data[start+9], data[start+10], data[start+11]
+	flags := uint32(f1)<<16 | uint32(f2)<<8 | uint32(f3)
 	info.Default = (flags & 1) != 0
 
 	offset := start + 12
@@ -226,34 +258,29 @@ func parseTkhd(f *os.File, start int64, size int64, info *TrackInfo) {
 	} else {
 		offset += 8
 	}
-	id32, _ := readU32At(f, offset)
-	info.TrackId = int(id32)
+	info.TrackId = readU32(data, offset)
 }
 
-func parseMdia(f *os.File, start int64, size int64, info *TrackInfo) {
+func parseMdia(data []byte, start, size int64, info *TrackInfo) {
 	end := start + size
 	pos := start + 8
-
 	for pos+8 <= end {
-		sz, _ := readU32At(f, pos)
-		typ, _ := readTypeAt(f, pos+4)
-
+		sz := readU32(data, pos)
+		typ := string(data[pos+4 : pos+8])
 		boxSize := int64(sz)
 		if sz == 1 {
-			ext, _ := readU64At(f, pos+8)
-			boxSize = int64(ext)
+			boxSize = int64(readU64(data, pos+8))
 		} else if sz == 0 {
 			boxSize = end - pos
 		}
 
 		if typ == "mdhd" {
-			parseMdhd(f, pos, info)
+			parseMdhd(data, pos, info)
 		} else if typ == "hdlr" {
-			parseHdlr(f, pos, info)
+			parseHdlr(data, pos, info)
 		} else if typ == "minf" {
-			parseMinf(f, pos, boxSize, info)
+			parseMinf(data, pos, boxSize, info)
 		}
-
 		if boxSize < 8 {
 			break
 		}
@@ -261,34 +288,29 @@ func parseMdia(f *os.File, start int64, size int64, info *TrackInfo) {
 	}
 }
 
-func parseMdhd(f *os.File, pos int64, info *TrackInfo) {
+func parseMdhd(data []byte, pos int64, info *TrackInfo) {
 	info.MdhdOffset = pos + 8
-
-	version, _ := readU8At(f, pos+8)
-	_ = version
-
-	// skip flags
+	version := data[pos+8]
 	cur := pos + 12
 
 	if version == 1 {
-		cur += 16
+		cur += 16 
 	} else {
 		cur += 8
 	}
-	cur += 4 // timescale
+	cur += 4 
 	if version == 1 {
-		cur += 8
+		cur += 8 
 	} else {
 		cur += 4
 	}
 
-	langBits, _ := readU16At(f, cur)
+	langBits := readU16(data, cur)
 	info.Language = decodeLanguage(langBits)
 }
 
-func parseHdlr(f *os.File, pos int64, info *TrackInfo) {
-	// version+flags+predefined = 8 bytes
-	htype, _ := readTypeAt(f, pos+8+8)
+func parseHdlr(data []byte, pos int64, info *TrackInfo) {
+	htype := string(data[pos+16 : pos+20])
 	switch htype {
 	case "vide":
 		info.Type = "video"
@@ -301,28 +323,22 @@ func parseHdlr(f *os.File, pos int64, info *TrackInfo) {
 	}
 }
 
-func parseMinf(f *os.File, start int64, size int64, info *TrackInfo) {
+func parseMinf(data []byte, start, size int64, info *TrackInfo) {
 	end := start + size
 	pos := start + 8
-
 	for pos+8 <= end {
-		sz, _ := readU32At(f, pos)
-		typ, _ := readTypeAt(f, pos+4)
-
-		var boxSize int64
+		sz := readU32(data, pos)
+		typ := string(data[pos+4 : pos+8])
+		boxSize := int64(sz)
 		if sz == 1 {
-			ext, _ := readU64At(f, pos+8)
-			boxSize = int64(ext)
+			boxSize = int64(readU64(data, pos+8))
 		} else if sz == 0 {
 			boxSize = end - pos
-		} else {
-			boxSize = int64(sz)
 		}
 
 		if typ == "stbl" {
-			parseStbl(f, pos, boxSize, info)
+			parseStbl(data, pos, boxSize, info)
 		}
-
 		if boxSize < 8 {
 			break
 		}
@@ -330,29 +346,27 @@ func parseMinf(f *os.File, start int64, size int64, info *TrackInfo) {
 	}
 }
 
-func parseStbl(f *os.File, start int64, size int64, info *TrackInfo) {
+func parseStbl(data []byte, start, size int64, info *TrackInfo) {
 	end := start + size
 	pos := start + 8
-
 	for pos+8 <= end {
-		sz, _ := readU32At(f, pos)
-		typ, _ := readTypeAt(f, pos+4)
-
-		var boxSize int64
+		sz := readU32(data, pos)
+		typ := string(data[pos+4 : pos+8])
+		boxSize := int64(sz)
 		if sz == 1 {
-			ext, _ := readU64At(f, pos+8)
-			boxSize = int64(ext)
+			boxSize = int64(readU64(data, pos+8))
 		} else if sz == 0 {
 			boxSize = end - pos
-		} else {
-			boxSize = int64(sz)
 		}
 
 		if typ == "stsd" {
 			info.StsdOffset = pos + 8
-			parseStsd(f, info)
+			if info.StsdOffset+16 <= int64(len(data)) {
+				sampleType := string(data[info.StsdOffset+12 : info.StsdOffset+16])
+				lc := strings.ToLower(sampleType)
+				info.Forced = strings.Contains(lc, "fcd") || strings.Contains(lc, "forced")
+			}
 		}
-
 		if boxSize < 8 {
 			break
 		}
@@ -360,20 +374,15 @@ func parseStbl(f *os.File, start int64, size int64, info *TrackInfo) {
 	}
 }
 
-func parseStsd(f *os.File, info *TrackInfo) {
-	// skip version + flags + entryCount → 8 bytes offset
-	sampleType, _ := readTypeAt(f, info.StsdOffset+8+4)
-
-	lc := strings.ToLower(sampleType)
-	info.Forced = strings.Contains(lc, "fcd") || strings.Contains(lc, "forced")
-}
+// ---------------------------------------------------------
+// Synchronous File Patchers
+// ---------------------------------------------------------
 
 func patchTkhdFlag(f *os.File, offset int64, val bool) {
-	f1, _ := readU8At(f, offset+1)
-	f2, _ := readU8At(f, offset+2)
-	f3, _ := readU8At(f, offset+3)
-
-	flags := int(f1)<<16 | int(f2)<<8 | int(f3)
+	var b [3]byte
+	f.ReadAt(b[:], offset+1)
+	
+	flags := uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
 
 	if val {
 		flags |= 1
@@ -381,60 +390,52 @@ func patchTkhdFlag(f *os.File, offset int64, val bool) {
 		flags &^= 1
 	}
 
-	f.Seek(offset+1, 0)
-	f.Write([]byte{
-		byte((flags >> 16) & 0xff),
-		byte((flags >> 8) & 0xff),
-		byte(flags & 0xff),
-	})
+	b[0] = byte(flags >> 16)
+	b[1] = byte(flags >> 8)
+	b[2] = byte(flags)
+	
+	f.WriteAt(b[:], offset+1)
 }
 
 func patchStsdFlag(f *os.File, offset int64, val bool) {
-	curType, _ := readTypeAt(f, offset+12)
+	var b [4]byte
+	f.ReadAt(b[:], offset+12)
+	curType := string(b[:])
+	
 	if val {
 		curType = "fcd "
 	}
-	f.Seek(offset+12, 0)
-	f.Write([]byte(curType))
+	f.WriteAt([]byte(curType), offset+12)
 }
 
-func decodeLanguage(bits uint16) string {
-	if bits == 0 {
-		return ""
+// ---------------------------------------------------------
+// POSIX Read-Only Mmap Wrapper
+// ---------------------------------------------------------
+
+func mapFile(path string) ([]byte, func(), error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
 	}
-	c1 := ((bits>>10)&31 + 0x60)
-	c2 := ((bits>>5)&31 + 0x60)
-	c3 := ((bits)&31 + 0x60)
-	return string([]byte{byte(c1), byte(c2), byte(c3)})
-}
+	defer f.Close()
 
-func readU8At(f *os.File, off int64) (uint8, error) {
-	var b [1]byte
-	_, err := f.ReadAt(b[:], off)
-	return b[0], err
-}
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	size := stat.Size()
+	if size == 0 {
+		return nil, nil, fmt.Errorf("file is empty")
+	}
 
-func readU16At(f *os.File, off int64) (uint16, error) {
-	var b [2]byte
-	_, err := f.ReadAt(b[:], off)
-	return binary.BigEndian.Uint16(b[:]), err
-}
+	// Always map as PROT_READ. It's incredibly fast and completely prevents page syncing bugs.
+	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, nil, err
+	}
 
-func readU32At(f *os.File, off int64) (uint32, error) {
-	var b [4]byte
-	_, err := f.ReadAt(b[:], off)
-	return binary.BigEndian.Uint32(b[:]), err
+	unmap := func() {
+		syscall.Munmap(data)
+	}
+	return data, unmap, nil
 }
-
-func readU64At(f *os.File, off int64) (uint64, error) {
-	var b [8]byte
-	_, err := f.ReadAt(b[:], off)
-	return binary.BigEndian.Uint64(b[:]), err
-}
-
-func readTypeAt(f *os.File, off int64) (string, error) {
-	var b [4]byte
-	_, err := f.ReadAt(b[:], off)
-	return string(b[:]), err
-}
-
