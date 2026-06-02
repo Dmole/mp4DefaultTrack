@@ -37,7 +37,7 @@ doit() {
 	sleep 0.1
 }
 
-doit java java -jar target/mp4JavaTrack.jar
+doit java java -XX:+UseSerialGC -Xms2m -Xmx8m -Xint -Xss512k -XX:CICompilerCount=1 -XX:+UseCompressedOops -jar target/mp4JavaTrack.jar
 doit javanative target/mp4JavaTrack
 doit rust target/mp4RustTrack
 doit go target/mp4GoTrack
