@@ -29,6 +29,9 @@ NAME="Mp4DefaultTrack"
 native-image \
 	--silent \
 	--no-fallback \
+	--gc=epsilon \
+	-Os \
+	-march=native \
 	-H:+UnlockExperimentalVMOptions \
 	-H:+StripDebugInfo \
 	-H:ClassInitialization=.:build_time \
